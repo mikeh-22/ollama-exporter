@@ -132,7 +132,13 @@ If Ollama is not on the same Docker network, replace `http://ollama:11434` with 
 
 ## Grafana dashboard
 
-A full Grafana dashboard with GPU utilisation, VRAM, temperatures, power, clock speeds, model info, per-request stats, and hung-job detection panels is included in the [homelab-configs](https://github.com/mikeh-22/homelab-configs) repository. Supports multi-host setups via a `gpu_host` Prometheus label.
+A full Grafana provisioning bundle is available at **[mikeh-22/ollama-grafana-dashboard](https://github.com/mikeh-22/ollama-grafana-dashboard)**, including:
+
+- **Dashboard** — GPU utilisation, VRAM, temperatures, power, clock speeds, model info, per-request stats, and hung-job detection
+- **Alert rules** — OllamaAPIDown, InferenceJobHung, GPUOverheat, GPUMemoryNearCapacity, OllamaContainerHighCPU
+- **Datasource config** — Prometheus datasource pre-configured
+
+Supports multi-host setups (AMD + NVIDIA) via a `gpu_host` Prometheus label.
 
 ## Development
 
