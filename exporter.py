@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Prometheus exporter for Ollama inference server with AMD GPU metrics.
-Reads GPU stats from sysfs (no rocm-smi dependency) and Ollama API.
-GPU cards are auto-discovered by scanning /sys/class/drm for cards that
-expose gpu_busy_percent (i.e. AMD dGPUs).
+Prometheus exporter for Ollama inference server.
 
-Features:
-- AMD GPU metrics via sysfs (utilisation, VRAM, temperature, power)
-- Ollama model state via /api/ps (model loaded, VRAM, context length)
-- Per-request metrics parsed from Ollama's GIN access logs via docker logs
-- Active job elapsed time tracking (GPU utilisation threshold crossing)
-- Hung-job detection (sustained high GPU utilisation duration)
+Supports two GPU backends, auto-detected at startup:
+  - AMD/sysfs   : reads /sys/class/drm/card*/device — no rocm-smi required
+  - NVIDIA/pynvml: reads NVML via nvidia-ml-py — requires NVIDIA container runtime
+
+Metrics common to both backends:
+  ollama_gpu_utilization_percent, ollama_gpu_memory_{used,total}_bytes,
+  ollama_gpu_temperature_celsius, ollama_gpu_power_watts,
+  ollama_gpu_high_util_duration_seconds, ollama_active_job_elapsed_seconds
+
+NVIDIA-only additional metrics:
+  ollama_gpu_memory_bandwidth_utilization_percent, ollama_gpu_clock_mhz,
+  ollama_gpu_fan_speed_percent, ollama_gpu_compute_process_count
+
+Per-request metrics are parsed from Ollama's GIN access logs via docker logs.
 """
 
 from __future__ import annotations
 
+import abc
 import glob
 import logging
 import os
@@ -36,35 +42,20 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 SCRAPE_INTERVAL = int(os.environ.get("SCRAPE_INTERVAL", "10"))
 OLLAMA_CONTAINER = os.environ.get("OLLAMA_CONTAINER", "ollama")
 EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "9101"))
-HIGH_UTIL_THRESHOLD = 80   # percent – hung-job detector
-ACTIVE_THRESHOLD = 20      # percent – active-job elapsed tracker
+HIGH_UTIL_THRESHOLD = 80
+ACTIVE_THRESHOLD = 20
 
 
 # ---------------------------------------------------------------------------
-# GPU discovery
+# Prometheus metrics — common to all backends
 # ---------------------------------------------------------------------------
 
-def discover_gpu_cards() -> list[tuple[int, str]]:
-    """
-    Return a sorted list of (logical_gpu_index, sysfs_device_path) tuples
-    for all DRM cards that expose gpu_busy_percent (AMD dGPUs).
-    """
-    found = []
-    for card_path in sorted(glob.glob("/sys/class/drm/card*/device")):
-        busy = os.path.join(card_path, "gpu_busy_percent")
-        if os.path.exists(busy):
-            found.append(card_path)
-    return [(idx, path) for idx, path in enumerate(found)]
-
-
-# ---------------------------------------------------------------------------
-# Prometheus metrics – GPU
-# ---------------------------------------------------------------------------
-
-gpu_util = Gauge("ollama_gpu_utilization_percent", "GPU utilisation 0-100", ["gpu"])
+gpu_util = Gauge("ollama_gpu_utilization_percent", "GPU compute utilisation 0-100", ["gpu"])
 gpu_mem_used = Gauge("ollama_gpu_memory_used_bytes", "VRAM used in bytes", ["gpu"])
 gpu_mem_total = Gauge("ollama_gpu_memory_total_bytes", "VRAM total in bytes", ["gpu"])
-gpu_temp = Gauge("ollama_gpu_temperature_celsius", "GPU temperature in Celsius", ["gpu", "sensor"])
+gpu_temp = Gauge(
+    "ollama_gpu_temperature_celsius", "GPU temperature in Celsius", ["gpu", "sensor"]
+)
 gpu_power = Gauge("ollama_gpu_power_watts", "GPU power draw in watts", ["gpu"])
 gpu_high_util_duration = Gauge(
     "ollama_gpu_high_util_duration_seconds",
@@ -76,20 +67,49 @@ active_job_elapsed = Gauge(
     f"Seconds since GPU utilisation crossed {ACTIVE_THRESHOLD}%% (0 when idle)",
     ["gpu"],
 )
+backend_info = Gauge(
+    "ollama_gpu_backend_info",
+    "Always 1; labels identify the active GPU backend and device count",
+    ["backend", "gpu_count"],
+)
 
 # ---------------------------------------------------------------------------
-# Prometheus metrics – Ollama model / API
+# Prometheus metrics — NVIDIA-only extras
+# ---------------------------------------------------------------------------
+
+gpu_mem_bandwidth_util = Gauge(
+    "ollama_gpu_memory_bandwidth_utilization_percent",
+    "GPU memory bandwidth utilisation 0-100 (NVIDIA only)",
+    ["gpu"],
+)
+gpu_clock = Gauge(
+    "ollama_gpu_clock_mhz",
+    "Current GPU clock speed in MHz (NVIDIA only)",
+    ["gpu", "type"],
+)
+gpu_fan = Gauge(
+    "ollama_gpu_fan_speed_percent",
+    "GPU fan speed 0-100 (NVIDIA only)",
+    ["gpu"],
+)
+gpu_compute_processes = Gauge(
+    "ollama_gpu_compute_process_count",
+    "Number of active compute processes on GPU (NVIDIA only)",
+    ["gpu"],
+)
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics — Ollama model / API
 # ---------------------------------------------------------------------------
 
 model_loaded = Gauge("ollama_model_loaded", "1 if model is loaded in memory", ["model"])
 model_vram = Gauge("ollama_model_vram_bytes", "VRAM occupied by loaded model", ["model"])
 model_context = Gauge("ollama_model_context_length", "Context length of loaded model", ["model"])
-
 api_up = Gauge("ollama_api_up", "1 if Ollama /api/ps responds successfully")
 api_latency = Gauge("ollama_api_response_seconds", "Latency of Ollama /api/ps endpoint")
 
 # ---------------------------------------------------------------------------
-# Prometheus metrics – per-request (from GIN log parsing)
+# Prometheus metrics — per-request (GIN log parsing)
 # ---------------------------------------------------------------------------
 
 request_counter = Counter(
@@ -99,7 +119,7 @@ request_counter = Counter(
 )
 request_duration = Histogram(
     "ollama_request_duration_seconds",
-    "Ollama inference request duration in seconds (from GIN logs, >1s only)",
+    "Ollama inference request duration in seconds (>1s requests only)",
     ["endpoint"],
     buckets=[1, 5, 15, 30, 60, 120, 180, 300, 600],
 )
@@ -113,20 +133,279 @@ last_duration = Gauge(
 )
 last_request_info = Gauge(
     "ollama_last_request_info",
-    "Labels carry info about the last completed request; value is always 1.0",
+    "Always 1.0; labels carry metadata about the last completed request",
     ["client", "endpoint", "status", "method"],
 )
 
 # ---------------------------------------------------------------------------
-# State tracking
+# Shared state
 # ---------------------------------------------------------------------------
 
 _high_util_since: dict[int, float | None] = {}
 _gpu_active_since: dict[int, float | None] = {}
 _prev_models: set[str] = set()
-
 _info_lock = threading.Lock()
 _last_info_labels: dict | None = None
+
+
+# ---------------------------------------------------------------------------
+# GPU state tracking helpers (shared between backends)
+# ---------------------------------------------------------------------------
+
+def _update_utilisation_tracking(
+    gpu_idx: int, util: float, now_mono: float, now_wall: float
+) -> None:
+    """Update hung-job and active-job elapsed Gauges for one GPU."""
+    _high_util_since.setdefault(gpu_idx, None)
+    _gpu_active_since.setdefault(gpu_idx, None)
+
+    if util > HIGH_UTIL_THRESHOLD:
+        if _high_util_since[gpu_idx] is None:
+            _high_util_since[gpu_idx] = now_mono
+        hung = now_mono - _high_util_since[gpu_idx]
+    else:
+        _high_util_since[gpu_idx] = None
+        hung = 0.0
+    gpu_high_util_duration.labels(gpu=str(gpu_idx)).set(hung)
+
+    if util >= ACTIVE_THRESHOLD:
+        if _gpu_active_since[gpu_idx] is None:
+            _gpu_active_since[gpu_idx] = now_wall
+        elapsed = now_wall - _gpu_active_since[gpu_idx]
+    else:
+        _gpu_active_since[gpu_idx] = None
+        elapsed = 0.0
+    active_job_elapsed.labels(gpu=str(gpu_idx)).set(elapsed)
+
+
+# ---------------------------------------------------------------------------
+# GPU backend abstraction
+# ---------------------------------------------------------------------------
+
+class GPUBackend(abc.ABC):
+    name: str = "unknown"
+
+    @abc.abstractmethod
+    def collect(self) -> None:
+        """Read GPU hardware and update Prometheus metrics."""
+
+    @abc.abstractmethod
+    def gpu_count(self) -> int:
+        """Return number of GPUs managed by this backend."""
+
+
+# ---------------------------------------------------------------------------
+# AMD sysfs backend
+# ---------------------------------------------------------------------------
+
+class AMDBackend(GPUBackend):
+    name = "AMD/sysfs"
+
+    def __init__(self, cards: list[tuple[int, str]]) -> None:
+        self.cards = cards
+
+    @classmethod
+    def detect(cls) -> AMDBackend | None:
+        """Return an AMDBackend if any AMD DRM cards are found via sysfs."""
+        found = [
+            path
+            for path in sorted(glob.glob("/sys/class/drm/card*/device"))
+            if os.path.exists(os.path.join(path, "gpu_busy_percent"))
+        ]
+        if not found:
+            return None
+        log.info("AMD/sysfs backend: discovered %d card(s)", len(found))
+        return cls(list(enumerate(found)))
+
+    def gpu_count(self) -> int:
+        return len(self.cards)
+
+    def collect(self) -> None:
+        now_mono = time.monotonic()
+        now_wall = time.time()
+
+        for gpu_idx, dev_path in self.cards:
+            util_val = _read_int(os.path.join(dev_path, "gpu_busy_percent"))
+            if util_val is not None:
+                gpu_util.labels(gpu=str(gpu_idx)).set(util_val)
+                _update_utilisation_tracking(gpu_idx, util_val, now_mono, now_wall)
+
+            vram_used = _read_int(os.path.join(dev_path, "mem_info_vram_used"))
+            vram_total = _read_int(os.path.join(dev_path, "mem_info_vram_total"))
+            if vram_used is not None:
+                gpu_mem_used.labels(gpu=str(gpu_idx)).set(vram_used)
+            if vram_total is not None:
+                gpu_mem_total.labels(gpu=str(gpu_idx)).set(vram_total)
+
+            hwmon = _hwmon_dir(dev_path)
+            if hwmon:
+                for sensor_file, sensor_name in [
+                    ("temp1_input", "edge"),
+                    ("temp2_input", "junction"),
+                    ("temp3_input", "memory"),
+                ]:
+                    milli = _read_int(os.path.join(hwmon, sensor_file))
+                    if milli is not None:
+                        gpu_temp.labels(gpu=str(gpu_idx), sensor=sensor_name).set(
+                            milli / 1000.0
+                        )
+
+                uw = _read_int(os.path.join(hwmon, "power1_average"))
+                if uw is not None:
+                    gpu_power.labels(gpu=str(gpu_idx)).set(uw / 1_000_000.0)
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA pynvml backend
+# ---------------------------------------------------------------------------
+
+class NvidiaBackend(GPUBackend):
+    name = "NVIDIA/pynvml"
+
+    def __init__(self, pynvml, handles: list) -> None:
+        self._pynvml = pynvml
+        self.handles = handles
+
+    @classmethod
+    def detect(cls) -> NvidiaBackend | None:
+        """Return a NvidiaBackend if NVML initialises successfully."""
+        try:
+            import pynvml  # noqa: PLC0415
+        except ImportError:
+            log.debug("pynvml not installed; NVIDIA backend unavailable")
+            return None
+        try:
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+            names = []
+            for h in handles:
+                try:
+                    names.append(pynvml.nvmlDeviceGetName(h))
+                except Exception:
+                    names.append("unknown")
+            log.info("NVIDIA/pynvml backend: %d device(s): %s", count, names)
+            return cls(pynvml, handles)
+        except Exception as exc:
+            log.debug("NVML init failed: %s", exc)
+            return None
+
+    def gpu_count(self) -> int:
+        return len(self.handles)
+
+    def collect(self) -> None:
+        pynvml = self._pynvml
+        now_mono = time.monotonic()
+        now_wall = time.time()
+
+        for gpu_idx, handle in enumerate(self.handles):
+            # Compute + memory bandwidth utilisation
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu_util.labels(gpu=str(gpu_idx)).set(util.gpu)
+                gpu_mem_bandwidth_util.labels(gpu=str(gpu_idx)).set(util.memory)
+                _update_utilisation_tracking(gpu_idx, util.gpu, now_mono, now_wall)
+            except Exception as exc:
+                log.debug("GPU %d utilisation error: %s", gpu_idx, exc)
+
+            # VRAM
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_mem_used.labels(gpu=str(gpu_idx)).set(mem.used)
+                gpu_mem_total.labels(gpu=str(gpu_idx)).set(mem.total)
+            except Exception as exc:
+                log.debug("GPU %d memory info error: %s", gpu_idx, exc)
+
+            # Temperature (NVML exposes GPU core; no separate junction/memory)
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(
+                    handle, pynvml.NVML_TEMPERATURE_GPU
+                )
+                gpu_temp.labels(gpu=str(gpu_idx), sensor="core").set(temp)
+            except Exception as exc:
+                log.debug("GPU %d temperature error: %s", gpu_idx, exc)
+
+            # Power (NVML returns milliwatts)
+            try:
+                mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+                gpu_power.labels(gpu=str(gpu_idx)).set(mw / 1000.0)
+            except Exception as exc:
+                log.debug("GPU %d power error: %s", gpu_idx, exc)
+
+            # Clock speeds (NVIDIA-specific)
+            try:
+                for clock_type, clock_name in [
+                    (pynvml.NVML_CLOCK_SM, "sm"),
+                    (pynvml.NVML_CLOCK_MEM, "memory"),
+                    (pynvml.NVML_CLOCK_GRAPHICS, "graphics"),
+                ]:
+                    mhz = pynvml.nvmlDeviceGetClockInfo(handle, clock_type)
+                    gpu_clock.labels(gpu=str(gpu_idx), type=clock_name).set(mhz)
+            except Exception as exc:
+                log.debug("GPU %d clock error: %s", gpu_idx, exc)
+
+            # Fan speed (NVIDIA-specific; may be N/A on some cards)
+            try:
+                fan_pct = pynvml.nvmlDeviceGetFanSpeed(handle)
+                gpu_fan.labels(gpu=str(gpu_idx)).set(fan_pct)
+            except Exception as exc:
+                log.debug("GPU %d fan speed error: %s", gpu_idx, exc)
+
+            # Active compute processes (NVIDIA-specific)
+            try:
+                procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                gpu_compute_processes.labels(gpu=str(gpu_idx)).set(len(procs))
+            except Exception as exc:
+                log.debug("GPU %d process count error: %s", gpu_idx, exc)
+
+
+# ---------------------------------------------------------------------------
+# No-op backend (no GPU found — Ollama API metrics still work)
+# ---------------------------------------------------------------------------
+
+class NoOpBackend(GPUBackend):
+    name = "none"
+
+    def gpu_count(self) -> int:
+        return 0
+
+    def collect(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+
+def detect_backend() -> GPUBackend:
+    """Auto-detect GPU backend: AMD first, then NVIDIA, then no-op."""
+    backend: GPUBackend = AMDBackend.detect() or NvidiaBackend.detect() or NoOpBackend()
+    if isinstance(backend, NoOpBackend):
+        log.warning(
+            "No GPU backend detected (AMD sysfs or NVIDIA pynvml). "
+            "GPU metrics will be unavailable; Ollama API metrics still active."
+        )
+    else:
+        log.info("Using %s backend with %d GPU(s)", backend.name, backend.gpu_count())
+    backend_info.labels(backend=backend.name, gpu_count=str(backend.gpu_count())).set(1)
+    return backend
+
+
+# ---------------------------------------------------------------------------
+# sysfs helpers (AMD backend)
+# ---------------------------------------------------------------------------
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _hwmon_dir(card_device_path: str) -> str | None:
+    dirs = sorted(glob.glob(os.path.join(card_device_path, "hwmon", "hwmon*")))
+    return dirs[0] if dirs else None
 
 
 # ---------------------------------------------------------------------------
@@ -160,20 +439,17 @@ def parse_go_duration(s: str) -> float:
 
 
 def _handle_gin_line(line: str) -> None:
-    """Parse one GIN log line and update metrics if it is a slow request (>1s)."""
+    """Parse one GIN log line and update metrics if the request took >1s."""
     m = GIN_PATTERN.search(line)
     if not m:
         return
 
     status_code, duration_str, client_ip, method, path = m.groups()
     duration = parse_go_duration(duration_str)
-
-    # Filter out fast /api/ps polling and other sub-second requests
     if duration <= 1.0:
         return
 
-    endpoint = path.split('?')[0]  # strip query string
-
+    endpoint = path.split('?')[0]
     request_counter.labels(endpoint=endpoint, status=status_code, method=method).inc()
     request_duration.labels(endpoint=endpoint).observe(duration)
 
@@ -204,7 +480,7 @@ def _handle_gin_line(line: str) -> None:
 
 
 def tail_docker_logs() -> None:
-    """Daemon thread: follow docker logs for the Ollama container and parse GIN lines."""
+    """Daemon thread: follow docker logs for the Ollama container."""
     log.info("Starting docker log tail thread for container '%s'", OLLAMA_CONTAINER)
     while True:
         try:
@@ -216,8 +492,7 @@ def tail_docker_logs() -> None:
             log.info("docker logs process started (pid=%d)", proc.pid)
             for raw_line in proc.stdout:
                 try:
-                    line = raw_line.decode('utf-8', errors='replace').rstrip()
-                    _handle_gin_line(line)
+                    _handle_gin_line(raw_line.decode('utf-8', errors='replace').rstrip())
                 except Exception as exc:
                     log.debug("Error processing log line: %s", exc)
             proc.wait()
@@ -227,95 +502,6 @@ def tail_docker_logs() -> None:
         except Exception as exc:
             log.error("tail_docker_logs error: %s", exc)
         time.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# sysfs helpers
-# ---------------------------------------------------------------------------
-
-def _read_sysfs(path: str) -> str | None:
-    try:
-        with open(path) as fh:
-            return fh.read().strip()
-    except OSError:
-        return None
-
-
-def _read_int(path: str) -> int | None:
-    val = _read_sysfs(path)
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except ValueError:
-        return None
-
-
-def _hwmon_dir(card_device_path: str) -> str | None:
-    dirs = sorted(glob.glob(os.path.join(card_device_path, "hwmon", "hwmon*")))
-    return dirs[0] if dirs else None
-
-
-# ---------------------------------------------------------------------------
-# GPU metric collection
-# ---------------------------------------------------------------------------
-
-def collect_gpu_metrics(gpu_cards: list[tuple[int, str]]) -> None:
-    now_mono = time.monotonic()
-    now_wall = time.time()
-
-    for gpu_idx, dev_path in gpu_cards:
-        _high_util_since.setdefault(gpu_idx, None)
-        _gpu_active_since.setdefault(gpu_idx, None)
-
-        # Utilisation
-        util_val = _read_int(os.path.join(dev_path, "gpu_busy_percent"))
-        if util_val is not None:
-            gpu_util.labels(gpu=str(gpu_idx)).set(util_val)
-
-            # Hung-job tracker (>80%)
-            if util_val > HIGH_UTIL_THRESHOLD:
-                if _high_util_since[gpu_idx] is None:
-                    _high_util_since[gpu_idx] = now_mono
-                hung_duration = now_mono - _high_util_since[gpu_idx]
-            else:
-                _high_util_since[gpu_idx] = None
-                hung_duration = 0.0
-            gpu_high_util_duration.labels(gpu=str(gpu_idx)).set(hung_duration)
-
-            # Active-job elapsed (>=20%)
-            if util_val >= ACTIVE_THRESHOLD:
-                if _gpu_active_since[gpu_idx] is None:
-                    _gpu_active_since[gpu_idx] = now_wall
-                elapsed = now_wall - _gpu_active_since[gpu_idx]
-            else:
-                _gpu_active_since[gpu_idx] = None
-                elapsed = 0.0
-            active_job_elapsed.labels(gpu=str(gpu_idx)).set(elapsed)
-
-        # VRAM
-        vram_used = _read_int(os.path.join(dev_path, "mem_info_vram_used"))
-        vram_total = _read_int(os.path.join(dev_path, "mem_info_vram_total"))
-        if vram_used is not None:
-            gpu_mem_used.labels(gpu=str(gpu_idx)).set(vram_used)
-        if vram_total is not None:
-            gpu_mem_total.labels(gpu=str(gpu_idx)).set(vram_total)
-
-        # Temperature and power via hwmon
-        hwmon = _hwmon_dir(dev_path)
-        if hwmon:
-            for sensor_file, sensor_name in [
-                ("temp1_input", "edge"),
-                ("temp2_input", "junction"),
-                ("temp3_input", "memory"),
-            ]:
-                milli = _read_int(os.path.join(hwmon, sensor_file))
-                if milli is not None:
-                    gpu_temp.labels(gpu=str(gpu_idx), sensor=sensor_name).set(milli / 1000.0)
-
-            uw = _read_int(os.path.join(hwmon, "power1_average"))
-            if uw is not None:
-                gpu_power.labels(gpu=str(gpu_idx)).set(uw / 1_000_000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +533,6 @@ def collect_ollama_metrics() -> None:
         name = entry.get("name", "unknown")
         current_models.add(name)
         model_loaded.labels(model=name).set(1)
-
         size_vram = entry.get("size_vram", 0)
         ctx = entry.get("context_length") or entry.get("details", {}).get("context_length", 0)
         if size_vram:
@@ -357,7 +542,6 @@ def collect_ollama_metrics() -> None:
 
     for stale in _prev_models - current_models:
         model_loaded.labels(model=stale).set(0)
-
     _prev_models = current_models
 
 
@@ -366,15 +550,10 @@ def collect_ollama_metrics() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    gpu_cards = discover_gpu_cards()
-    log.info(
-        "Discovered %d GPU(s): %s",
-        len(gpu_cards),
-        [(idx, path) for idx, path in gpu_cards],
-    )
+    backend = detect_backend()
+
     log.info("Starting Ollama Prometheus exporter on port %d", EXPORTER_PORT)
     log.info("Ollama URL: %s  |  Scrape interval: %ds", OLLAMA_URL, SCRAPE_INTERVAL)
-
     start_http_server(EXPORTER_PORT)
 
     log_thread = threading.Thread(target=tail_docker_logs, daemon=True)
@@ -383,7 +562,7 @@ def main() -> None:
 
     while True:
         try:
-            collect_gpu_metrics(gpu_cards)
+            backend.collect()
         except Exception as exc:
             log.error("GPU metric collection error: %s", exc)
         try:
