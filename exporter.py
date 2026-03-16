@@ -138,6 +138,27 @@ last_request_info = Gauge(
 )
 
 # ---------------------------------------------------------------------------
+# Prometheus metrics — context window (requires OLLAMA_DEBUG=1 on Ollama)
+# ---------------------------------------------------------------------------
+
+ctx_prompt_tokens = Gauge(
+    "ollama_last_request_prompt_tokens",
+    "Prompt token count at start of last inference request (requires OLLAMA_DEBUG=1)",
+)
+ctx_kv_reuse_tokens = Gauge(
+    "ollama_last_request_kv_cache_reuse_tokens",
+    "KV cache tokens reused from prior turn in last request (requires OLLAMA_DEBUG=1)",
+)
+ctx_eval_tokens = Gauge(
+    "ollama_last_request_eval_tokens",
+    "Generated token count of last inference request (requires OLLAMA_DEBUG=1)",
+)
+ctx_fill_ratio = Gauge(
+    "ollama_last_request_context_fill_ratio",
+    "Context window fill ratio at last request — prompt_tokens / context_length (requires OLLAMA_DEBUG=1)",
+)
+
+# ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 
@@ -146,6 +167,8 @@ _gpu_active_since: dict[int, float | None] = {}
 _prev_models: set[str] = set()
 _info_lock = threading.Lock()
 _last_info_labels: dict | None = None
+_current_context_length: int = 0
+_context_length_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +439,18 @@ GIN_PATTERN = re.compile(
     r'\[GIN\].*\|\s*(\d+)\s*\|\s*([\w\d.µns]+)\s*\|\s*([\d.]+(?:\.\d+)?)\s*\|\s*(\w+)\s+"([^"]+)"'
 )
 
+# OLLAMA_DEBUG=1: fires at the start of every inference request
+# Example: msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657
+CACHE_SLOT_PATTERN = re.compile(
+    r'msg="loading cache slot"\s+\S+\s+cache=\d+\s+prompt=(\d+)\s+used=(\d+)\s+remaining=\d+'
+)
+
+# OLLAMA_DEBUG=1: fires after each inference request completes (llama_print_timings)
+# Example: llama:        eval time =   8765.43 ms /   298 runs
+EVAL_TIMING_PATTERN = re.compile(
+    r'(?<!prompt )\beval time\s*=\s*[\d.]+\s*ms\s*/\s*(\d+)\s+runs'
+)
+
 
 def parse_go_duration(s: str) -> float:
     """Convert a Go duration string (e.g. '2m47s', '35.838µs') to seconds."""
@@ -479,6 +514,37 @@ def _handle_gin_line(line: str) -> None:
     )
 
 
+def _handle_debug_line(line: str) -> None:
+    """Parse OLLAMA_DEBUG=1 log lines for context window metrics."""
+    m = CACHE_SLOT_PATTERN.search(line)
+    if m:
+        prompt_tokens = int(m.group(1))
+        reuse_tokens = int(m.group(2))
+        ctx_prompt_tokens.set(prompt_tokens)
+        ctx_kv_reuse_tokens.set(reuse_tokens)
+        with _context_length_lock:
+            ctx_len = _current_context_length
+        if ctx_len > 0:
+            ratio = prompt_tokens / ctx_len
+            ctx_fill_ratio.set(ratio)
+            log.info(
+                "Context slot: prompt=%d tokens  reuse=%d  fill=%.1f%%  (ctx_len=%d)",
+                prompt_tokens, reuse_tokens, ratio * 100, ctx_len,
+            )
+        else:
+            log.info(
+                "Context slot: prompt=%d tokens  reuse=%d  (ctx_len unknown)",
+                prompt_tokens, reuse_tokens,
+            )
+        return
+
+    m = EVAL_TIMING_PATTERN.search(line)
+    if m:
+        eval_tokens = int(m.group(1))
+        ctx_eval_tokens.set(eval_tokens)
+        log.info("Eval tokens: %d", eval_tokens)
+
+
 def tail_docker_logs() -> None:
     """Daemon thread: follow docker logs for the Ollama container."""
     log.info("Starting docker log tail thread for container '%s'", OLLAMA_CONTAINER)
@@ -492,7 +558,9 @@ def tail_docker_logs() -> None:
             log.info("docker logs process started (pid=%d)", proc.pid)
             for raw_line in proc.stdout:
                 try:
-                    _handle_gin_line(raw_line.decode('utf-8', errors='replace').rstrip())
+                    line = raw_line.decode('utf-8', errors='replace').rstrip()
+                    _handle_gin_line(line)
+                    _handle_debug_line(line)
                 except Exception as exc:
                     log.debug("Error processing log line: %s", exc)
             proc.wait()
@@ -539,6 +607,9 @@ def collect_ollama_metrics() -> None:
             model_vram.labels(model=name).set(size_vram)
         if ctx:
             model_context.labels(model=name).set(ctx)
+            with _context_length_lock:
+                global _current_context_length
+                _current_context_length = ctx
 
     for stale in _prev_models - current_models:
         model_loaded.labels(model=stale).set(0)

@@ -58,6 +58,22 @@ AMD is tried first, then NVIDIA. The active backend is identified by the `ollama
 | `ollama_last_request_duration_seconds` | — | Duration of last completed request |
 | `ollama_last_request_info` | `client`, `endpoint`, `status`, `method` | Always 1.0; labels carry last-request metadata |
 
+### Context window (requires `OLLAMA_DEBUG=1` on the Ollama container)
+
+| Metric | Labels | Description |
+|---|---|---|
+| `ollama_last_request_prompt_tokens` | — | Prompt token count at start of last request |
+| `ollama_last_request_kv_cache_reuse_tokens` | — | Tokens reused from KV cache (prior-turn prefix hit) |
+| `ollama_last_request_eval_tokens` | — | Generated token count of last request |
+| `ollama_last_request_context_fill_ratio` | — | `prompt_tokens / context_length` (0–1) |
+
+Parsed from Ollama's `cache.go` debug log line that fires at the start of every request:
+```
+msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657
+```
+
+Enable by adding `OLLAMA_DEBUG=1` to the Ollama container environment. The exporter picks these up automatically via the existing `docker logs --follow` thread — no restart of the exporter required.
+
 ## Requirements
 
 - Ollama running in a Docker container (named `ollama` by default, or set `OLLAMA_CONTAINER`)

@@ -12,9 +12,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from exporter import (
     GIN_PATTERN,
+    CACHE_SLOT_PATTERN,
+    EVAL_TIMING_PATTERN,
     AMDBackend,
     NvidiaBackend,
     _handle_gin_line,
+    _handle_debug_line,
     _update_utilisation_tracking,
     parse_go_duration,
 )
@@ -307,3 +310,72 @@ class TestNvidiaBackend:
 
         backend = NvidiaBackend(mock_pynvml, [mock_handle])
         backend.collect()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Context window debug log parsing
+# ---------------------------------------------------------------------------
+
+class TestCacheSlotPattern:
+    def test_matches_standard_line(self):
+        line = 'time=2026-03-16T05:26:02.649Z level=DEBUG source=cache.go:151 msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657'
+        m = CACHE_SLOT_PATTERN.search(line)
+        assert m is not None
+        assert m.group(1) == "58657"  # prompt tokens
+        assert m.group(2) == "0"      # reuse tokens
+
+    def test_matches_with_cache_reuse(self):
+        line = 'msg="loading cache slot" id=0 cache=0 prompt=12000 used=8000 remaining=4000'
+        m = CACHE_SLOT_PATTERN.search(line)
+        assert m is not None
+        assert m.group(1) == "12000"
+        assert m.group(2) == "8000"
+
+    def test_no_match_on_unrelated_line(self):
+        assert CACHE_SLOT_PATTERN.search("[GIN] 2026/03/16 - 200 | 5s | POST /api/chat") is None
+
+    def test_no_match_on_gin_line(self):
+        assert CACHE_SLOT_PATTERN.search("prompt eval time = 1234 ms / 512 tokens") is None
+
+
+class TestEvalTimingPattern:
+    def test_matches_eval_time_line(self):
+        line = "llama:        eval time =   8765.43 ms /   298 runs   (  29.41 ms per token)"
+        m = EVAL_TIMING_PATTERN.search(line)
+        assert m is not None
+        assert m.group(1) == "298"
+
+    def test_does_not_match_prompt_eval_time(self):
+        # Must not capture the "eval time" fragment inside "prompt eval time"
+        line = "llama: prompt eval time =   1234.56 ms /   512 tokens"
+        assert EVAL_TIMING_PATTERN.search(line) is None
+
+    def test_no_match_on_unrelated_line(self):
+        assert EVAL_TIMING_PATTERN.search("model loaded successfully") is None
+
+
+class TestHandleDebugLine:
+    def test_cache_slot_updates_metrics(self):
+        import exporter
+        exporter._current_context_length = 131072
+        line = 'msg="loading cache slot" id=0 cache=0 prompt=65536 used=32768 remaining=32768'
+        _handle_debug_line(line)
+        assert exporter.ctx_prompt_tokens._value.get() == pytest.approx(65536)
+        assert exporter.ctx_kv_reuse_tokens._value.get() == pytest.approx(32768)
+        assert exporter.ctx_fill_ratio._value.get() == pytest.approx(65536 / 131072)
+
+    def test_cache_slot_with_unknown_context_length(self):
+        import exporter
+        exporter._current_context_length = 0
+        line = 'msg="loading cache slot" id=0 cache=0 prompt=1000 used=0 remaining=1000'
+        _handle_debug_line(line)  # must not raise; fill_ratio not updated
+        assert exporter.ctx_prompt_tokens._value.get() == pytest.approx(1000)
+
+    def test_eval_timing_updates_metric(self):
+        import exporter
+        line = "llama:        eval time =  5000.00 ms /   150 runs   (33.33 ms per token)"
+        _handle_debug_line(line)
+        assert exporter.ctx_eval_tokens._value.get() == pytest.approx(150)
+
+    def test_unrelated_line_is_silent(self):
+        _handle_debug_line("some random log line with no patterns")  # must not raise
