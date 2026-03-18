@@ -11,13 +11,14 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from exporter import (
-    GIN_PATTERN,
     CACHE_SLOT_PATTERN,
+    COMPLETION_REQUEST_PATTERN,
     EVAL_TIMING_PATTERN,
+    GIN_PATTERN,
     AMDBackend,
     NvidiaBackend,
-    _handle_gin_line,
     _handle_debug_line,
+    _handle_gin_line,
     _update_utilisation_tracking,
     parse_go_duration,
 )
@@ -316,20 +317,39 @@ class TestNvidiaBackend:
 # Context window debug log parsing
 # ---------------------------------------------------------------------------
 
+class TestCompletionRequestPattern:
+    def test_matches_standard_line(self):
+        line = 'time=2026-03-18T20:01:01.931Z level=DEBUG source=server.go:1536 msg="completion request" images=0 prompt=284432 format=""'
+        m = COMPLETION_REQUEST_PATTERN.search(line)
+        assert m is not None
+        assert m.group(1) == "284432"
+
+    def test_matches_minimal_line(self):
+        line = 'msg="completion request" images=0 prompt=58657 format=""'
+        m = COMPLETION_REQUEST_PATTERN.search(line)
+        assert m is not None
+        assert m.group(1) == "58657"
+
+    def test_no_match_on_unrelated_line(self):
+        assert COMPLETION_REQUEST_PATTERN.search("[GIN] 2026/03/16 - 200 | 5s | POST /api/chat") is None
+
+    def test_no_match_on_cache_slot_line(self):
+        line = 'msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657'
+        assert COMPLETION_REQUEST_PATTERN.search(line) is None
+
+
 class TestCacheSlotPattern:
     def test_matches_standard_line(self):
         line = 'time=2026-03-16T05:26:02.649Z level=DEBUG source=cache.go:151 msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657'
         m = CACHE_SLOT_PATTERN.search(line)
         assert m is not None
-        assert m.group(1) == "58657"  # prompt tokens
-        assert m.group(2) == "0"      # reuse tokens
+        assert m.group(1) == "0"  # reuse slots (used=)
 
     def test_matches_with_cache_reuse(self):
         line = 'msg="loading cache slot" id=0 cache=0 prompt=12000 used=8000 remaining=4000'
         m = CACHE_SLOT_PATTERN.search(line)
         assert m is not None
-        assert m.group(1) == "12000"
-        assert m.group(2) == "8000"
+        assert m.group(1) == "8000"  # reuse slots (used=)
 
     def test_no_match_on_unrelated_line(self):
         assert CACHE_SLOT_PATTERN.search("[GIN] 2026/03/16 - 200 | 5s | POST /api/chat") is None
@@ -355,21 +375,27 @@ class TestEvalTimingPattern:
 
 
 class TestHandleDebugLine:
-    def test_cache_slot_updates_metrics(self):
+    def test_completion_request_updates_prompt_tokens_and_fill_ratio(self):
         import exporter
-        exporter._current_context_length = 131072
-        line = 'msg="loading cache slot" id=0 cache=0 prompt=65536 used=32768 remaining=32768'
+        exporter._current_context_length = 202752
+        line = 'time=2026-03-18T20:01:01.931Z level=DEBUG source=server.go:1536 msg="completion request" images=0 prompt=284432 format=""'
         _handle_debug_line(line)
-        assert exporter.ctx_prompt_tokens._value.get() == pytest.approx(65536)
-        assert exporter.ctx_kv_reuse_tokens._value.get() == pytest.approx(32768)
-        assert exporter.ctx_fill_ratio._value.get() == pytest.approx(65536 / 131072)
+        assert exporter.ctx_prompt_tokens._value.get() == pytest.approx(284432)
+        assert exporter.ctx_fill_ratio._value.get() == pytest.approx(284432 / 202752)
 
-    def test_cache_slot_with_unknown_context_length(self):
+    def test_completion_request_with_unknown_context_length(self):
         import exporter
         exporter._current_context_length = 0
-        line = 'msg="loading cache slot" id=0 cache=0 prompt=1000 used=0 remaining=1000'
+        line = 'msg="completion request" images=0 prompt=1000 format=""'
         _handle_debug_line(line)  # must not raise; fill_ratio not updated
         assert exporter.ctx_prompt_tokens._value.get() == pytest.approx(1000)
+
+    def test_cache_slot_updates_kv_reuse_only(self):
+        import exporter
+        exporter._current_context_length = 202752
+        line = 'msg="loading cache slot" id=0 cache=68213 prompt=68213 used=33568 remaining=34645'
+        _handle_debug_line(line)
+        assert exporter.ctx_kv_reuse_tokens._value.get() == pytest.approx(33568)
 
     def test_eval_timing_updates_metric(self):
         import exporter
