@@ -143,7 +143,7 @@ last_request_info = Gauge(
 
 ctx_prompt_tokens = Gauge(
     "ollama_last_request_prompt_tokens",
-    "Prompt token count at start of last inference request (requires OLLAMA_DEBUG=1)",
+    "Actual prompt token count from completion request log (requires OLLAMA_DEBUG=1)",
 )
 ctx_kv_reuse_tokens = Gauge(
     "ollama_last_request_kv_cache_reuse_tokens",
@@ -155,7 +155,7 @@ ctx_eval_tokens = Gauge(
 )
 ctx_fill_ratio = Gauge(
     "ollama_last_request_context_fill_ratio",
-    "Context window fill ratio at last request — prompt_tokens / context_length (requires OLLAMA_DEBUG=1)",
+    "Context window fill ratio at last request — actual_prompt_tokens / context_length (requires OLLAMA_DEBUG=1)",
 )
 
 # ---------------------------------------------------------------------------
@@ -439,10 +439,17 @@ GIN_PATTERN = re.compile(
     r'\[GIN\].*\|\s*(\d+)\s*\|\s*([\w\d.µns]+)\s*\|\s*([\d.]+(?:\.\d+)?)\s*\|\s*(\w+)\s+"([^"]+)"'
 )
 
-# OLLAMA_DEBUG=1: fires at the start of every inference request
+# OLLAMA_DEBUG=1: fires at the start of every inference request — actual prompt token count
+# Example: msg="completion request" images=0 prompt=284432 format=""
+COMPLETION_REQUEST_PATTERN = re.compile(
+    r'msg="completion request".*\bprompt=(\d+)'
+)
+
+# OLLAMA_DEBUG=1: fires at the start of every inference request — KV cache reuse stats
 # Example: msg="loading cache slot" id=0 cache=0 prompt=58657 used=0 remaining=58657
+# NOTE: prompt= here is MLA-compressed KV slot count, NOT raw token count. Only used= is tracked.
 CACHE_SLOT_PATTERN = re.compile(
-    r'msg="loading cache slot"\s+\S+\s+cache=\d+\s+prompt=(\d+)\s+used=(\d+)\s+remaining=\d+'
+    r'msg="loading cache slot"\s+\S+\s+cache=\d+\s+prompt=\d+\s+used=(\d+)\s+remaining=\d+'
 )
 
 # OLLAMA_DEBUG=1: fires after each inference request completes (llama_print_timings)
@@ -516,26 +523,31 @@ def _handle_gin_line(line: str) -> None:
 
 def _handle_debug_line(line: str) -> None:
     """Parse OLLAMA_DEBUG=1 log lines for context window metrics."""
-    m = CACHE_SLOT_PATTERN.search(line)
+    m = COMPLETION_REQUEST_PATTERN.search(line)
     if m:
         prompt_tokens = int(m.group(1))
-        reuse_tokens = int(m.group(2))
         ctx_prompt_tokens.set(prompt_tokens)
-        ctx_kv_reuse_tokens.set(reuse_tokens)
         with _context_length_lock:
             ctx_len = _current_context_length
         if ctx_len > 0:
             ratio = prompt_tokens / ctx_len
             ctx_fill_ratio.set(ratio)
             log.info(
-                "Context slot: prompt=%d tokens  reuse=%d  fill=%.1f%%  (ctx_len=%d)",
-                prompt_tokens, reuse_tokens, ratio * 100, ctx_len,
+                "Completion request: prompt=%d tokens  fill=%.1f%%  (ctx_len=%d)",
+                prompt_tokens, ratio * 100, ctx_len,
             )
         else:
             log.info(
-                "Context slot: prompt=%d tokens  reuse=%d  (ctx_len unknown)",
-                prompt_tokens, reuse_tokens,
+                "Completion request: prompt=%d tokens  (ctx_len unknown)",
+                prompt_tokens,
             )
+        return
+
+    m = CACHE_SLOT_PATTERN.search(line)
+    if m:
+        reuse_tokens = int(m.group(1))
+        ctx_kv_reuse_tokens.set(reuse_tokens)
+        log.info("KV cache: reuse=%d compressed slots", reuse_tokens)
         return
 
     m = EVAL_TIMING_PATTERN.search(line)
